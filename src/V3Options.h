@@ -296,6 +296,8 @@ private:
     bool m_threadsDpiPure = true;   // main switch: --threads-dpi all/pure
     bool m_threadsDpiUnpure = false;  // main switch: --threads-dpi all
     VOptionBool m_timing;           // main switch: --timing
+    bool m_semanticTrace = false;   // main switch: --semantic-trace
+    string m_semanticTraceFile;     // filename for --semantic-trace
     bool m_trace = false;           // main switch: --trace
     bool m_traceCoverage = false;   // main switch: --trace-coverage
     bool m_traceEnabledFst = false;  // main switch: --trace-fst
@@ -551,6 +553,8 @@ public:
     bool threadsDpiUnpure() const { return m_threadsDpiUnpure; }
     bool threadsCoarsen() const { return m_threadsCoarsen; }
     VOptionBool timing() const { return m_timing; }
+    bool semanticTrace() const { return m_semanticTrace; }
+    const string& semanticTraceFile() const { return m_semanticTraceFile; }
     bool trace() const { return m_trace; }
     bool traceCoverage() const { return m_traceCoverage; }
     bool traceEnabledFst() const { return m_traceEnabledFst; }

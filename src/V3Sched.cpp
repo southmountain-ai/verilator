@@ -350,7 +350,38 @@ void orderSequentially(AstCFunc* funcp, const LogicByScope& lbs) {
                             bodyp = loopp;
                         }
                     }
+                    if (v3Global.opt.semanticTrace()) {
+                        FileLine* const pflp = procp->fileline();
+                        // Determine process kind string from AST node type and keyword.
+                        std::string kindStr = "procedure";
+                        if (const AstAlways* const alwaysp = VN_CAST(procp, Always)) {
+                            switch (alwaysp->keyword().m_e) {
+                            case VAlwaysKwd::ALWAYS_FF:    kindStr = "always_ff";   break;
+                            case VAlwaysKwd::ALWAYS_COMB:  kindStr = "always_comb"; break;
+                            case VAlwaysKwd::ALWAYS_LATCH: kindStr = "always_latch"; break;
+                            default:                       kindStr = "always";      break;
+                            }
+                        } else if (VN_IS(procp, AlwaysPre)) {
+                            kindStr = "nba_pre";
+                        } else if (VN_IS(procp, AlwaysPost)) {
+                            kindStr = "nba_post";
+                        }
+                        const std::string file
+                            = V3OutFormatter::quoteNameControls(pflp->filename());
+                        const std::string procId
+                            = kindStr + "@" + file + ":" + std::to_string(pflp->lineno());
+                        const std::string tp = "vlSymsp->__Vm_semanticTracep";
+                        subFuncp->addStmtsp(new AstCStmt{
+                            pflp, "VL_SEMANTIC_TRACE_PROCESS_START(" + tp + ", \""
+                                      + procId + "\", \"" + kindStr
+                                      + "\", \"clocked\");\n"});
+                    }
                     subFuncp->addStmtsp(bodyp);
+                    if (v3Global.opt.semanticTrace()) {
+                        subFuncp->addStmtsp(new AstCStmt{
+                            procp->fileline(),
+                            "VL_SEMANTIC_TRACE_PROCESS_END(vlSymsp->__Vm_semanticTracep);\n"});
+                    }
                     if (procp->needProcess()) subFuncp->setNeedProcess();
                     util::splitCheck(subFuncp);
                 }
@@ -648,8 +679,23 @@ void createEval(AstNetlist* netlistp,  //
             }
             // Resume triggered timing schedulers
             if (timingResumep) workp = AstNode::addNext(workp, timingResumep->makeStmt());
+            // Semantic trace: active region start (pass current sim time)
+            if (v3Global.opt.semanticTrace()) {
+                workp = AstNode::addNext(
+                    workp,
+                    new AstCStmt{flp,
+                                 "VL_SEMANTIC_TRACE_ACTIVE_START(vlSymsp->__Vm_semanticTracep,"
+                                 " (uint64_t)vlSymsp->_vm_contextp__->time());\n"});
+            }
             // Invoke the 'act' function
             workp = AstNode::addNext(workp, util::callVoidFunc(actKit.m_funcp));
+            // Semantic trace: active region end
+            if (v3Global.opt.semanticTrace()) {
+                workp = AstNode::addNext(
+                    workp,
+                    new AstCStmt{flp,
+                                 "VL_SEMANTIC_TRACE_ACTIVE_END(vlSymsp->__Vm_semanticTracep);\n"});
+            }
             //
             return workp;
         }());
@@ -715,8 +761,22 @@ void createEval(AstNetlist* netlistp,  //
             } else if (!reactKit.empty()) {
                 workp = trigKit.newOrIntoCall(reactKit.m_vscp, nbaKit.m_vscp);
             }
+            // Semantic trace: NBA region start
+            if (v3Global.opt.semanticTrace()) {
+                workp = AstNode::addNext(
+                    workp,
+                    new AstCStmt{flp,
+                                 "VL_SEMANTIC_TRACE_NBA_START(vlSymsp->__Vm_semanticTracep);\n"});
+            }
             // Invoke the 'nba' function
             workp = AstNode::addNext(workp, util::callVoidFunc(nbaKit.m_funcp));
+            // Semantic trace: NBA region end
+            if (v3Global.opt.semanticTrace()) {
+                workp = AstNode::addNext(
+                    workp,
+                    new AstCStmt{flp,
+                                 "VL_SEMANTIC_TRACE_NBA_END(vlSymsp->__Vm_semanticTracep);\n"});
+            }
             // Clear the 'nba' triggers
             workp = AstNode::addNext(workp, trigKit.newClearCall(nbaKit.m_vscp));
             //

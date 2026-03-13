@@ -25,6 +25,7 @@
 #include "verilatedos.h"
 
 #include "V3Ast.h"
+#include "V3File.h"
 #include "V3Graph.h"
 #include "V3OrderGraph.h"
 #include "V3Sched.h"
@@ -148,6 +149,30 @@ public:
             // AstActives in V3Order.
             return stmtsp;
         }();
+        // ---- Semantic trace: compute per-process ID/kind before the loop ----
+        std::string stKindStr;
+        std::string stProcId;
+        const bool stEnabled = v3Global.opt.semanticTrace() && procp && !suspendable;
+        if (stEnabled) {
+            FileLine* const flp = procp->fileline();
+            stKindStr = "always";
+            if (const AstAlways* const alwaysp = VN_CAST(procp, Always)) {
+                switch (alwaysp->keyword().m_e) {
+                case VAlwaysKwd::ALWAYS_FF:    stKindStr = "always_ff";    break;
+                case VAlwaysKwd::ALWAYS_COMB:  stKindStr = "always_comb";  break;
+                case VAlwaysKwd::ALWAYS_LATCH: stKindStr = "always_latch"; break;
+                default:                       stKindStr = "always";       break;
+                }
+            } else if (VN_IS(procp, AlwaysPre)) {
+                stKindStr = "nba_pre";
+            } else if (VN_IS(procp, AlwaysPost)) {
+                stKindStr = "nba_post";
+            }
+            const std::string file = V3OutFormatter::quoteNameControls(flp->filename());
+            stProcId = stKindStr + "@" + file + ":" + std::to_string(flp->lineno());
+        }
+        bool stInjectedStart = false;
+
         // Process each statement in the list starting at headp
         for (AstNode *currp = headp, *nextp; currp; currp = nextp) {
             nextp = currp->nextp();
@@ -171,10 +196,24 @@ public:
                 // Record function and sensitivity to call it with
                 m_result.emplace_back(m_funcp, domainp);
             }
+            // Inject PROCESS_START as the very first statement in the function
+            if (stEnabled && !stInjectedStart) {
+                stInjectedStart = true;
+                const std::string tp = "vlSymsp->__Vm_semanticTracep";
+                m_funcp->addStmtsp(new AstCStmt{procp->fileline(),
+                    "VL_SEMANTIC_TRACE_PROCESS_START(" + tp + ", \""
+                    + stProcId + "\", \"" + stKindStr + "\", \"clocked\");\n"});
+            }
             // Add the code to the current function
             m_funcp->addStmtsp(currp);
             // If splitting, add in the size of the code we just added
             if (m_split) m_size += currp->nodeCount();
+        }
+        // Inject PROCESS_END after all statements in the last function
+        if (stInjectedStart) {
+            const std::string tp = "vlSymsp->__Vm_semanticTracep";
+            m_funcp->addStmtsp(new AstCStmt{procp->fileline(),
+                "VL_SEMANTIC_TRACE_PROCESS_END(" + tp + ");\n"});
         }
         // Put suspendable processes into individual functions on their own
         if (suspendable) forceNewFunction();
