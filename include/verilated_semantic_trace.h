@@ -139,7 +139,26 @@ public:
 
     // Register the human-readable description for a trigger bit index.
     // Must be called BEFORE simStart() so the map appears in the sim_start record.
+    //
+    // LIMITATION: only bits 0–63 (word 0 of the trigger vector) are captured.
+    // Designs with >64 unique sensitivities will have bits >=64 registered here but
+    // their values silently dropped from trigger_vec (which only records word 0).
+    //
+    // To extend to multi-word support:
+    //   1. Change activeRegionStart / nbaRegionStart to accept
+    //      (uint64_t time, const uint64_t* trigWords, uint32_t nWords).
+    //   2. Emit trigger_vec as a JSON array: ["0x...", "0x..."].
+    //   3. Update VL_SEMANTIC_TRACE_ACTIVE_START / NBA_START macros accordingly.
+    //   4. In V3Sched.cpp, pass &triggered[0] and trigKit.m_nVecWords instead of [0U].
+    //   The trigger_map bit indices are already absolute, so no schema change needed there.
     void registerTrigger(uint32_t bit, const char* desc) {
+        if (bit >= 64) {
+            fprintf(stderr,
+                    "%%Warning: --semantic-trace: trigger bit %u is in word %u (beyond word 0); "
+                    "its value will not appear in trigger_vec (only 64 bits captured). "
+                    "See verilated_semantic_trace.h for multi-word extension notes.\n",
+                    bit, bit / 64);
+        }
         if (bit >= static_cast<uint32_t>(m_actTrigDescs.size()))
             m_actTrigDescs.resize(bit + 1);
         m_actTrigDescs[bit] = desc;

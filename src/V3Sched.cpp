@@ -679,6 +679,22 @@ void createEval(AstNetlist* netlistp,  //
             if (timingResumep) workp = AstNode::addNext(workp, timingResumep->makeStmt());
             // Semantic trace: active region start (pass current sim time)
             if (v3Global.opt.semanticTrace()) {
+                // Only word 0 of the trigger vector is captured. Designs with >64 unique
+                // sensitivities produce multiple words and the extra bits are silently dropped.
+                // To support multiple words: change VL_SEMANTIC_TRACE_ACTIVE_START to accept
+                //   (tracep, time, const uint64_t* trigWords, uint32_t nWords)
+                // and emit trigger_vec as a JSON array ["0x...", "0x..."].
+                // The trigger_map bit indices already use absolute positions so no schema change
+                // is needed there; only activeRegionStart/nbaRegionStart need updating.
+                if (trigKit.nVecWords() > 1) {
+                    netlistp->v3warn(E_UNSUPPORTED,
+                                     "--semantic-trace: this design has "
+                                         << (trigKit.nVecWords() * TriggerKit::WORD_SIZE)
+                                         << " trigger bits (" << trigKit.nVecWords()
+                                         << " words); only the first 64 bits (word 0) will be "
+                                            "captured in trigger_vec. See V3Sched.cpp for how to "
+                                            "extend to multi-word support.");
+                }
                 workp = AstNode::addNext(
                     workp,
                     new AstCStmt{flp,

@@ -292,6 +292,7 @@ public:
     }
     AstCFunc* compBasep() const { return m_compVecp; }
     const std::string& name() const { return m_name; }
+    uint32_t nVecWords() const { return m_nVecWords; }
     const std::unordered_map<const AstSenTree*, AstSenTree*>& mapPre() const { return m_mapPre; }
     const std::unordered_map<const AstSenTree*, AstSenTree*>& mapVec() const { return m_mapVec; }
 
