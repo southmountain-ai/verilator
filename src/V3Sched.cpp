@@ -350,7 +350,9 @@ void orderSequentially(AstCFunc* funcp, const LogicByScope& lbs) {
                             bodyp = loopp;
                         }
                     }
-                    if (v3Global.opt.semanticTrace()) {
+                    const bool stTrackProcess
+                        = !VN_IS(procp, AlwaysPre) && !VN_IS(procp, AlwaysPost);
+                    if (v3Global.opt.semanticTrace() && stTrackProcess) {
                         FileLine* const pflp = procp->fileline();
                         // Determine process kind string from AST node type and keyword.
                         std::string kindStr = "procedure";
@@ -361,10 +363,6 @@ void orderSequentially(AstCFunc* funcp, const LogicByScope& lbs) {
                             case VAlwaysKwd::ALWAYS_LATCH: kindStr = "always_latch"; break;
                             default:                       kindStr = "always";      break;
                             }
-                        } else if (VN_IS(procp, AlwaysPre)) {
-                            kindStr = "nba_pre";
-                        } else if (VN_IS(procp, AlwaysPost)) {
-                            kindStr = "nba_post";
                         }
                         const std::string file
                             = V3OutFormatter::quoteNameControls(pflp->filename());
@@ -377,7 +375,7 @@ void orderSequentially(AstCFunc* funcp, const LogicByScope& lbs) {
                                       + "\", \"clocked\");\n"});
                     }
                     subFuncp->addStmtsp(bodyp);
-                    if (v3Global.opt.semanticTrace()) {
+                    if (v3Global.opt.semanticTrace() && stTrackProcess) {
                         subFuncp->addStmtsp(new AstCStmt{
                             procp->fileline(),
                             "VL_SEMANTIC_TRACE_PROCESS_END(vlSymsp->__Vm_semanticTracep);\n"});
@@ -685,7 +683,9 @@ void createEval(AstNetlist* netlistp,  //
                     workp,
                     new AstCStmt{flp,
                                  "VL_SEMANTIC_TRACE_ACTIVE_START(vlSymsp->__Vm_semanticTracep,"
-                                 " (uint64_t)vlSymsp->_vm_contextp__->time());\n"});
+                                 " (uint64_t)vlSymsp->_vm_contextp__->time(),"
+                                 " (uint64_t)vlSelfRef."
+                                     + actKit.m_vscp->varp()->name() + "[0U]);\n"});
             }
             // Invoke the 'act' function
             workp = AstNode::addNext(workp, util::callVoidFunc(actKit.m_funcp));
@@ -766,7 +766,9 @@ void createEval(AstNetlist* netlistp,  //
                 workp = AstNode::addNext(
                     workp,
                     new AstCStmt{flp,
-                                 "VL_SEMANTIC_TRACE_NBA_START(vlSymsp->__Vm_semanticTracep);\n"});
+                                 "VL_SEMANTIC_TRACE_NBA_START(vlSymsp->__Vm_semanticTracep,"
+                                 " (uint64_t)vlSelfRef."
+                                     + nbaKit.m_vscp->varp()->name() + "[0U]);\n"});
             }
             // Invoke the 'nba' function
             workp = AstNode::addNext(workp, util::callVoidFunc(nbaKit.m_funcp));

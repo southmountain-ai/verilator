@@ -1059,6 +1059,13 @@ std::vector<std::string> EmitCSyms::getSymCtorStmts() {
             = V3OutFormatter::quoteNameControls(v3Global.opt.semanticTraceFile());
         add("// Initialize semantic execution trace");
         add("__Vm_semanticTracep = new VerilatedSemanticTrace(\"" + escapedFile + "\");");
+        // Register trigger descriptions before simStart() so they appear in sim_start record
+        const std::vector<std::string>& trigDescs = v3Global.rootp()->semanticActTrigDescs();
+        for (uint32_t i = 0; i < static_cast<uint32_t>(trigDescs.size()); ++i) {
+            if (trigDescs[i].empty()) continue;
+            add("__Vm_semanticTracep->registerTrigger(" + std::to_string(i) + ", \""
+                + V3OutFormatter::quoteNameControls(trigDescs[i]) + "\");");
+        }
         add("__Vm_semanticTracep->simStart(\"" + topClassName() + "\");");
     }
 

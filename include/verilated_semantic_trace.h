@@ -16,19 +16,27 @@
 ///
 /// When a design is compiled with --semantic-trace <file>, the generated
 /// simulation model includes calls to this class.  It writes a JSONL file
-/// where each line is one trace record capturing scheduler-level semantics:
-/// which processes fired, what nonblocking assignments they queued (tentative
-/// values in the active region), and what was committed in the NBA region.
+/// where each line is one trace record capturing the simulator's causal
+/// execution model: which regions fired and why, which processes ran in what
+/// order, and what tentative next-state values were computed.
+///
+/// Design principle: every field must help a model understand WHY the
+/// simulator executed something and HOW it reached the next state.
+/// Signal value dumps belong in VCD; scheduler causality belongs here.
 ///
 /// Record types (see trace_schema/trace_schema.md for full spec):
 ///   sim_start      — emitted once at simulation start
 ///   sim_end        — emitted once at simulation end
-///   active_region  — start of active scheduling region for a time step
-///   process_start  — one always_ff / always_comb / assign process firing
-///   process_end    — end of that process
-///   nba_write      — tentative NBA write queued during active region
-///   nba_region     — NBA flush: all __Vdly__ commits for this time step
-///   nba_commit     — one signal committed during NBA region
+///   active_region  — one iteration of the active scheduling region
+///   nba_region     — one iteration of the NBA scheduling region
+///
+/// Fields added to region records for scheduler causality:
+///   iteration      — 0-indexed loop iteration within the current time step
+///   trigger_count  — number of trigger bits that fired (popcount of trigger_vec)
+///   trigger_vec    — raw trigger vector word 0 as hex (which processes are sensitive)
+///
+/// Fields added to per-process records:
+///   process_index  — execution order within the region (0 = first)
 ///
 //=============================================================================
 
@@ -37,7 +45,6 @@
 
 #include <cassert>
 #include <cstdint>
-#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -46,7 +53,7 @@
 // VerilatedSemanticTrace
 //
 // One instance per simulation run.  Not thread-safe (Verilator single-eval
-// mode only for now; MT support can be added later).
+// mode only; MT support can be added later).
 //=============================================================================
 
 class VerilatedSemanticTrace final {
@@ -56,19 +63,25 @@ class VerilatedSemanticTrace final {
     std::ofstream m_out;              // Output JSONL file
     uint64_t      m_time = 0;         // Current simulation time
     uint32_t      m_delta = 0;        // Current delta cycle within time step
-    bool          m_inActive = false; // Are we inside an active region record?
-    bool          m_inNba    = false; // Are we inside an NBA region record?
-    bool          m_inProcess = false; // Are we inside a process record?
-    bool          m_firstProcess = true;  // For JSON array comma handling
-    bool          m_firstCommit  = true;  // For JSON array comma handling
+    bool          m_inActive = false; // Inside an active_region record?
+    bool          m_inNba    = false; // Inside an nba_region record?
+    bool          m_inProcess = false; // Inside a process record?
+    bool          m_firstProcess = true;  // JSON comma guard for processes array
+    bool          m_firstNbaWrite = true;  // JSON comma guard for nba_writes array
 
-    uint32_t m_nbaWriteCount = 0;  // count of NBA writes queued this active region
+    // Trigger map: index i holds the human-readable description of trigger bit i.
+    // Populated by registerTrigger() before simStart() is called.
+    std::vector<std::string> m_actTrigDescs;
+
+    // Scheduler causality counters
+    uint64_t m_actIteration = 0;  // Active region iterations at current time step
+    uint64_t m_nbaIteration = 0;  // NBA region iterations at current time step
+    uint32_t m_processIndex = 0;  // Execution order of processes within current region
 
     // =========================================================================
     // JSON helpers (no external dependency)
     // =========================================================================
 
-    // Escape a string for JSON (handles \, ", and control chars)
     static std::string jsonStr(const std::string& s) {
         std::string out;
         out.reserve(s.size() + 2);
@@ -89,15 +102,18 @@ class VerilatedSemanticTrace final {
         return jsonStr(std::string(s ? s : ""));
     }
 
-    // Format a uint64 value as a hex string (e.g. "0x1f")
     static std::string hexVal(uint64_t v) {
         std::ostringstream ss;
         ss << "\"0x" << std::hex << v << '"';
         return ss.str();
     }
 
-    void emit(const std::string& line) {
-        m_out << line << '\n';
+    // Portable popcount for trigger_count field
+    static uint32_t popcount64(uint64_t v) {
+        v = v - ((v >> 1) & 0x5555555555555555ULL);
+        v = (v & 0x3333333333333333ULL) + ((v >> 2) & 0x3333333333333333ULL);
+        v = (v + (v >> 4)) & 0x0f0f0f0f0f0f0f0fULL;
+        return static_cast<uint32_t>((v * 0x0101010101010101ULL) >> 56);
     }
 
 public:
@@ -108,8 +124,6 @@ public:
     explicit VerilatedSemanticTrace(const std::string& filename) {
         m_out.open(filename, std::ios::out | std::ios::trunc);
         if (!m_out.is_open()) {
-            // Mimic Verilator fatal pattern; in practice the generated code
-            // checks this at startup.
             fprintf(stderr, "%%Error: Cannot open semantic trace file: %s\n",
                     filename.c_str());
         }
@@ -123,14 +137,34 @@ public:
     // Simulation lifecycle
     // =========================================================================
 
+    // Register the human-readable description for a trigger bit index.
+    // Must be called BEFORE simStart() so the map appears in the sim_start record.
+    void registerTrigger(uint32_t bit, const char* desc) {
+        if (bit >= static_cast<uint32_t>(m_actTrigDescs.size()))
+            m_actTrigDescs.resize(bit + 1);
+        m_actTrigDescs[bit] = desc;
+    }
+
     void simStart(const std::string& designId) {
-        emit("{\"type\":\"sim_start\","
-             "\"design_id\":" + jsonStr(designId) + "}");
+        m_out << "{\"type\":\"sim_start\","
+              << "\"design_id\":" << jsonStr(designId);
+        if (!m_actTrigDescs.empty()) {
+            m_out << ",\"trigger_map\":{";
+            bool first = true;
+            for (uint32_t i = 0; i < static_cast<uint32_t>(m_actTrigDescs.size()); ++i) {
+                if (m_actTrigDescs[i].empty()) continue;
+                if (!first) m_out << ",";
+                m_out << "\"" << i << "\":" << jsonStr(m_actTrigDescs[i]);
+                first = false;
+            }
+            m_out << "}";
+        }
+        m_out << "}\n";
     }
 
     void simEnd() {
-        emit("{\"type\":\"sim_end\","
-             "\"time\":" + std::to_string(m_time) + "}");
+        m_out << "{\"type\":\"sim_end\","
+              << "\"time\":" << m_time << "}\n";
         m_out.flush();
     }
 
@@ -138,36 +172,39 @@ public:
     // Active region
     // =========================================================================
 
-    // Call before _eval_phase__act().
-    // Pass the current simulation time so the record is correctly time-stamped.
-    // Resets the delta counter when time advances.
-    void activeRegionStart(uint64_t time) {
+    // Call before the active work executes in _eval_phase__act().
+    //   time       — current simulation time (vlSymsp->_vm_contextp__->time())
+    //   trigWord   — first word of the act trigger vector (which sensitivities fired)
+    void activeRegionStart(uint64_t time, uint64_t trigWord) {
         assert(!m_inActive);
         m_inActive = true;
         m_firstProcess = true;
-        m_nbaWriteCount = 0;
+        m_processIndex = 0;
 
         if (time != m_time) {
+            // New time step: reset all per-step counters
             m_time = time;
             m_delta = 0;
+            m_actIteration = 0;
+            m_nbaIteration = 0;
         }
 
-        // Begin the active_region record; process array opened here.
         m_out << "{\"type\":\"active_region\","
               << "\"time\":" << m_time << ","
               << "\"delta\":" << m_delta << ","
+              << "\"iteration\":" << m_actIteration << ","
+              << "\"trigger_count\":" << popcount64(trigWord) << ","
+              << "\"trigger_vec\":" << hexVal(trigWord) << ","
               << "\"processes\":[";
+
+        ++m_actIteration;
     }
 
-    // Call after _eval_phase__act().
+    // Call after the active work completes in _eval_phase__act().
     void activeRegionEnd() {
         assert(m_inActive);
         m_inActive = false;
-
-        // Close process array; add pending NBA writes summary.
-        m_out << "],"
-              << "\"nba_writes_queued\":" << m_nbaWriteCount
-              << "}\n";
+        m_out << "]}\n";
     }
 
     // =========================================================================
@@ -175,14 +212,11 @@ public:
     // =========================================================================
 
     // Called just before entering a generated process function body.
-    //   processId — source location string e.g. "always_ff@fifo.sv:38"
-    //   kind      — "always_ff", "always_comb", "assign", etc.
-    //   trigger   — sensitivity expression e.g. "posedge clk"
-    void processStart(const char* processId, const char* kind,
-                      const char* trigger) {
-        // processStart/End are injected into region subfunctions by both
-        // orderSequentially and V3OrderCFuncEmitter.  Skip calls that fire
-        // outside any tracked region (initial, static, final, settle, etc.).
+    //   processId    — source location e.g. "always_ff@fifo.sv:59"
+    //   kind         — "always_ff", "always_comb", "always", etc.
+    //   trigger      — sensitivity string (currently "clocked"; full decoding is future work)
+    void processStart(const char* processId, const char* kind, const char* trigger) {
+        // Skip calls outside any tracked region (initial, static, final, settle, etc.)
         if (!m_inActive && !m_inNba) return;
         assert(!m_inProcess);
         m_inProcess = true;
@@ -191,92 +225,79 @@ public:
         m_firstProcess = false;
 
         m_out << "{\"process_id\":" << jsonStr(processId) << ","
-              << "\"kind\":"       << jsonStr(kind)      << ","
-              << "\"trigger\":"    << jsonStr(trigger)   << ","
+              << "\"process_index\":" << m_processIndex << ","
+              << "\"kind\":" << jsonStr(kind) << ","
+              << "\"trigger\":" << jsonStr(trigger) << ","
               << "\"nba_writes\":[";
-        m_firstCommit = true;  // reuse for inner nba_writes array
+        m_firstNbaWrite = true;
+        ++m_processIndex;
     }
 
     // Called after the process function body returns.
     void processEnd() {
-        if (!m_inProcess) return;  // processStart was skipped (outside active region)
+        if (!m_inProcess) return;  // processStart was skipped (outside tracked region)
         m_inProcess = false;
         m_out << "]}";
     }
 
-    // Called inside a process body when a __Vdly__ variable is written
-    // (i.e., a nonblocking assignment has been evaluated).
+    // Called inside a process body when a top-level __Vdly__ variable is written
+    // (i.e., a nonblocking assignment has been evaluated in the active-region pass).
     //   signal         — RTL signal name (without __Vdly__ prefix)
-    //   tentativeValue — the value just written to __Vdly__
-    //   currentValue   — the current (pre-NBA-commit) value of the signal
-    void nbaPending(const char* signal, uint64_t tentativeValue,
-                    uint64_t currentValue) {
-        assert(m_inProcess);
+    //   tentativeValue — the value just written to the shadow variable
+    //   currentValue   — the pre-commit value of the real signal
+    void nbaPending(const char* signal, uint64_t tentativeValue, uint64_t currentValue) {
+        if (!m_inProcess) return;
 
-        if (!m_firstCommit) m_out << ',';
-        m_firstCommit = false;
+        if (!m_firstNbaWrite) m_out << ',';
+        m_firstNbaWrite = false;
 
-        m_out << "{\"signal\":"    << jsonStr(signal) << ","
-              << "\"tentative\":"  << hexVal(tentativeValue) << ","
-              << "\"current\":"    << hexVal(currentValue)   << "}";
-
-        ++m_nbaWriteCount;
+        m_out << "{\"signal\":" << jsonStr(signal) << ","
+              << "\"tentative\":" << hexVal(tentativeValue) << ","
+              << "\"current\":" << hexVal(currentValue) << "}";
     }
 
     // =========================================================================
     // NBA region
     // =========================================================================
 
-    // Call before _eval_phase__nba().
-    void nbaRegionStart() {
+    // Call before the NBA work executes in _eval_phase__nba().
+    //   trigWord — first word of the nba trigger vector (which processes are pending)
+    void nbaRegionStart(uint64_t trigWord) {
         assert(!m_inNba);
         m_inNba = true;
         m_firstProcess = true;
-        m_firstCommit = true;
+        m_processIndex = 0;
         ++m_delta;
 
         m_out << "{\"type\":\"nba_region\","
               << "\"time\":" << m_time << ","
               << "\"delta\":" << m_delta << ","
+              << "\"iteration\":" << m_nbaIteration << ","
+              << "\"trigger_count\":" << popcount64(trigWord) << ","
+              << "\"trigger_vec\":" << hexVal(trigWord) << ","
               << "\"processes\":[";
+
+        ++m_nbaIteration;
     }
 
-    // Call after _eval_phase__nba().
+    // Call after the NBA work completes in _eval_phase__nba().
     void nbaRegionEnd() {
         assert(m_inNba);
         m_inNba = false;
-        m_out << "],\"committed\":[]}\n";
+        m_out << "]}\n";
         ++m_delta;
-    }
-
-    // Called just before each `real_signal = __Vdly__signal` commit.
-    //   signal       — RTL signal name
-    //   oldVal       — current value of the real signal (before commit)
-    //   newVal       — value in the __Vdly__ shadow (about to be committed)
-    //   sourceProcess — process_id that queued this write ("always_ff@...")
-    void nbaCommit(const char* signal, uint64_t oldVal, uint64_t newVal,
-                   const char* sourceProcess) {
-        assert(m_inNba);
-
-        if (!m_firstCommit) m_out << ',';
-        m_firstCommit = false;
-
-        m_out << "{\"signal\":"         << jsonStr(signal)        << ","
-              << "\"old\":"             << hexVal(oldVal)          << ","
-              << "\"new\":"             << hexVal(newVal)          << ","
-              << "\"source_process\":"  << jsonStr(sourceProcess)  << "}";
     }
 };
 
 //=============================================================================
 // Convenience macros used in generated code
 //
-// These are no-ops when semantic tracing is disabled (pointer is nullptr).
-// The compiler will eliminate the branches entirely at -O2.
+// All macros are no-ops when semantic tracing is disabled (pointer is nullptr).
+// The compiler eliminates the branches entirely at -O2.
 //=============================================================================
 
-#define VL_SEMANTIC_TRACE_ACTIVE_START(tracep, time) \
-    do { if (tracep) (tracep)->activeRegionStart(time); } while (false)
+#define VL_SEMANTIC_TRACE_ACTIVE_START(tracep, time, trigger_word) \
+    do { if (tracep) (tracep)->activeRegionStart(time, trigger_word); } while (false)
 
 #define VL_SEMANTIC_TRACE_ACTIVE_END(tracep) \
     do { if (tracep) (tracep)->activeRegionEnd(); } while (false)
@@ -290,13 +311,13 @@ public:
 #define VL_SEMANTIC_TRACE_NBA_PENDING(tracep, sig, tentative, current) \
     do { if (tracep) (tracep)->nbaPending(sig, tentative, current); } while (false)
 
-#define VL_SEMANTIC_TRACE_NBA_START(tracep) \
-    do { if (tracep) (tracep)->nbaRegionStart(); } while (false)
+#define VL_SEMANTIC_TRACE_NBA_START(tracep, trigger_word) \
+    do { if (tracep) (tracep)->nbaRegionStart(trigger_word); } while (false)
 
 #define VL_SEMANTIC_TRACE_NBA_END(tracep) \
     do { if (tracep) (tracep)->nbaRegionEnd(); } while (false)
 
-#define VL_SEMANTIC_TRACE_NBA_COMMIT(tracep, sig, old_val, new_val, proc) \
-    do { if (tracep) (tracep)->nbaCommit(sig, old_val, new_val, proc); } while (false)
+#define VL_SEMANTIC_TRACE_REGISTER_TRIGGER(tracep, bit, desc) \
+    do { if (tracep) (tracep)->registerTrigger(bit, desc); } while (false)
 
 #endif  // VERILATOR_VERILATED_SEMANTIC_TRACE_H_

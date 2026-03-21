@@ -1267,6 +1267,9 @@ class AstNetlist final : public AstNode {
     VTimescale m_timeprecision;  // Global time precision
     bool m_timescaleSpecified = false;  // Input HDL specified timescale
     uint32_t m_nTraceCodes = 0;  // Number of trace codes used by design
+    // Trigger descriptions for semantic trace (bit index → human-readable description).
+    // Populated in V3SchedTrigger for the "act" kit; consumed by V3EmitCSyms.
+    std::vector<std::string> m_semanticActTrigDescs;
 public:
     AstNetlist();
     ASTGEN_MEMBERS_AstNetlist;
@@ -1310,6 +1313,12 @@ public:
     bool timescaleSpecified() const { return m_timescaleSpecified; }
     uint32_t nTraceCodes() const { return m_nTraceCodes; }
     void nTraceCodes(uint32_t value) { m_nTraceCodes = value; }
+    const std::vector<std::string>& semanticActTrigDescs() const { return m_semanticActTrigDescs; }
+    void addSemanticActTrigDesc(uint32_t bit, const std::string& desc) {
+        if (bit >= static_cast<uint32_t>(m_semanticActTrigDescs.size()))
+            m_semanticActTrigDescs.resize(bit + 1);
+        m_semanticActTrigDescs[bit] = desc;
+    }
     AstVarScope* stlFirstIterationp();
     void clearStlFirstIterationp() { m_stlFirstIterationp = nullptr; }
 };

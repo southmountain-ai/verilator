@@ -649,6 +649,9 @@ TriggerKit TriggerKit::create(AstNetlist* netlistp,  //
         std::string desc = VString::quoteBackslash(ss.str());
         desc = VString::replaceSubstr(desc, "\n", "\\n");
         addDebug(i, desc);
+        // Semantic trace: store description for sense trigger bit i (act kit only)
+        if (name == "act" && v3Global.opt.semanticTrace())
+            netlistp->addSemanticActTrigDesc(static_cast<uint32_t>(i), ss.str());
     }
     UASSERT(trigps.size() == nSenseTriggers, "Inconsistent number of trigger expressions");
 
@@ -656,8 +659,12 @@ TriggerKit TriggerKit::create(AstNetlist* netlistp,  //
 
     // Add a print for each of the extra triggers
     for (unsigned i = 0; i < extraTriggers.size(); ++i) {
-        addDebug(nSenseTriggers + i,
-                 "Internal '" + name + "' trigger - " + extraTriggers.m_descriptions.at(i));
+        const std::string extraDesc
+            = "Internal '" + name + "' trigger - " + extraTriggers.m_descriptions.at(i);
+        addDebug(nSenseTriggers + i, extraDesc);
+        // Semantic trace: store description for extra trigger bit (act kit only)
+        if (name == "act" && v3Global.opt.semanticTrace())
+            netlistp->addSemanticActTrigDesc(nSenseTriggers + i, extraDesc);
     }
 
     // Construct the maps from old SenTrees to new SenTrees

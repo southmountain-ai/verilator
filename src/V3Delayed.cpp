@@ -119,6 +119,8 @@
 
 #include "V3AstUserAllocator.h"
 #include "V3Const.h"
+#include "V3File.h"
+#include "V3SemanticTraceTag.h"
 #include "V3Stats.h"
 
 #include <deque>
@@ -292,6 +294,120 @@ class DelayedVisitor final : public VNVisitor {
     VDouble0 m_nSharedSetFlags;  // "Set" flags actually shared by Scheme::FlagShared variables
 
     // METHODS
+    struct SourceInfo final {
+        std::string processId;
+        std::string processKind;
+        std::string sourceFile;
+        int sourceLine = 0;
+    };
+
+    static std::string normalizeSignalName(const std::string& name) {
+        std::string out = VString::replaceWord(name, "__DOT__", ".");
+        out = VString::replaceWord(out, "__BRA__", "[");
+        out = VString::replaceWord(out, "__KET__", "]");
+        return out;
+    }
+
+    static std::string processKind(const AstNodeProcedure* procp) {
+        if (!procp) return "procedure";
+        if (const AstAlways* const alwaysp = VN_CAST(procp, Always)) {
+            switch (alwaysp->keyword().m_e) {
+            case VAlwaysKwd::ALWAYS_FF: return "always_ff";
+            case VAlwaysKwd::ALWAYS_COMB: return "always_comb";
+            case VAlwaysKwd::ALWAYS_LATCH: return "always_latch";
+            default: return "always";
+            }
+        }
+        if (VN_IS(procp, AlwaysPre)) return "nba_pre";
+        if (VN_IS(procp, AlwaysPost)) return "nba_post";
+        return "procedure";
+    }
+
+    static const AstNodeProcedure* enclosingProcess(const AstNode* nodep) {
+        for (const AstNode* curp = nodep; curp; curp = curp->backp()) {
+            if (const AstNodeProcedure* const procp = VN_CAST(curp, NodeProcedure)) return procp;
+        }
+        return nullptr;
+    }
+
+    static SourceInfo sourceInfo(const AstNode* sourceNodep) {
+        SourceInfo out;
+        const AstNodeProcedure* const procp = enclosingProcess(sourceNodep);
+        FileLine* flp = sourceNodep->fileline();
+        out.processKind = processKind(procp);
+        if (procp) flp = procp->fileline();
+        out.sourceFile = flp->filename();
+        out.sourceLine = flp->lineno();
+        out.processId = out.processKind + "@"
+                        + V3OutFormatter::quoteNameControls(out.sourceFile) + ":"
+                        + cvtToStr(out.sourceLine);
+        return out;
+    }
+
+    static const char* schemeName(const Scheme scheme) {
+        switch (scheme) {
+        case Scheme::Undecided: return "Undecided";
+        case Scheme::UnsupportedCompoundArrayInLoop: return "UnsupportedCompoundArrayInLoop";
+        case Scheme::ShadowVar: return "ShadowVar";
+        case Scheme::ShadowVarMasked: return "ShadowVarMasked";
+        case Scheme::FlagShared: return "FlagShared";
+        case Scheme::FlagUnique: return "FlagUnique";
+        case Scheme::ValueQueueWhole: return "ValueQueueWhole";
+        case Scheme::ValueQueuePartial: return "ValueQueuePartial";
+        }
+        return "Unknown";
+    }
+
+    static bool isRobustSemanticSubset(const AstVarScope* vscp, const VarScopeInfo& vscpInfo) {
+        if (vscpInfo.m_scheme != Scheme::ShadowVar) return false;
+        const AstNodeDType* const dtypep = vscp->dtypep()->skipRefp();
+        if (VN_IS(dtypep, UnpackArrayDType)) return false;
+        return dtypep->isIntegralOrPacked();
+    }
+
+    void tagPendingAssign(const AstAssignDly* sourceNbap, const AstVarScope* vscp,
+                          const AstVarScope* shadowVscp, const VarScopeInfo& vscpInfo) {
+        if (!v3Global.opt.semanticTrace()) return;
+        if (!isRobustSemanticSubset(vscp, vscpInfo)) return;
+        const SourceInfo src = sourceInfo(sourceNbap);
+        V3SemanticTraceTag::Provenance tag;
+        tag.sourceProcessId = src.processId;
+        tag.sourceKind = src.processKind;
+        tag.signalName = normalizeSignalName(vscp->varp()->name());
+        tag.scheme = schemeName(vscpInfo.m_scheme);
+        tag.sourceFile = src.sourceFile;
+        tag.sourceLine = src.sourceLine;
+        tag.realCppName = vscp->varp()->name();
+        tag.updateKind = V3SemanticTraceTag::UpdateKind::Pending;
+        V3SemanticTraceTag::setPending(shadowVscp->varp()->name(), std::move(tag));
+    }
+
+    void tagCommitAssign(const AstVarScope* vscp, const VarScopeInfo& vscpInfo) {
+        if (!v3Global.opt.semanticTrace()) return;
+        if (!isRobustSemanticSubset(vscp, vscpInfo)) return;
+        const AstNode* const sourceNodep
+            = vscpInfo.m_firstNbaRefp ? static_cast<const AstNode*>(vscpInfo.m_firstNbaRefp)
+                                      : static_cast<const AstNode*>(vscp);
+        const SourceInfo src = sourceInfo(sourceNodep);
+        V3SemanticTraceTag::Provenance tag;
+        tag.sourceProcessId = src.processId;
+        tag.sourceKind = src.processKind;
+        tag.signalName = normalizeSignalName(vscp->varp()->name());
+        tag.scheme = schemeName(vscpInfo.m_scheme);
+        tag.sourceFile = src.sourceFile;
+        tag.sourceLine = src.sourceLine;
+        tag.realCppName = vscp->varp()->name();
+        tag.updateKind = V3SemanticTraceTag::UpdateKind::Commit;
+        V3SemanticTraceTag::setCommit(vscp->varp()->name(), std::move(tag));
+    }
+
+    void maybeLogScheme(const AstVarScope* vscp, const VarScopeInfo& vscpInfo) const {
+        if (!v3Global.opt.semanticTrace()) return;
+        UINFO(2, "semantic-trace nba scheme: signal="
+                     << normalizeSignalName(vscp->varp()->name()) << " scheme="
+                     << schemeName(vscpInfo.m_scheme) << " partial="
+                     << (vscpInfo.m_partial ? "1" : "0") << '\n');
+    }
 
     // Return true iff a variable is assigned by both blocking and nonblocking
     // assignments. Issue BLKANDNBLK error if we can't prove the mixed
@@ -604,8 +720,11 @@ class DelayedVisitor final : public VNVisitor {
         // Add 'Post' scheduled 'originalVariable = shadowVariable' assignment
         AstAlwaysPost* const postp = new AstAlwaysPost{flp};
         activep->addStmtsp(postp);
-        postp->addStmtsp(new AstAssign{flp, new AstVarRef{flp, vscp, VAccess::WRITE},
-                                       new AstVarRef{flp, shadowVscp, VAccess::READ}});
+        AstAssign* const commitp
+            = new AstAssign{flp, new AstVarRef{flp, vscp, VAccess::WRITE},
+                            new AstVarRef{flp, shadowVscp, VAccess::READ}};
+        postp->addStmtsp(commitp);
+        tagCommitAssign(vscp, vscpInfo);
     }
     void convertSchemeShadowVar(AstAssignDly* nodep, AstVarScope* vscp, VarScopeInfo& vscpInfo) {
         UASSERT_OBJ(vscpInfo.m_scheme == Scheme::ShadowVar, vscp, "Inconsistent NBA scheme");
@@ -618,6 +737,7 @@ class DelayedVisitor final : public VNVisitor {
             refp->varScopep(shadowVscp);
             refp->varp(shadowVscp->varp());
         });
+        tagPendingAssign(nodep, vscp, shadowVscp, vscpInfo);
     }
 
     // Scheme::ShadowVarMasked
@@ -1003,6 +1123,7 @@ class DelayedVisitor final : public VNVisitor {
         for (AstVarScope* const vscp : m_vscps) {
             VarScopeInfo& vscpInfo = m_vscpInfo(vscp);
             vscpInfo.m_scheme = chooseScheme(vscp, vscpInfo);
+            maybeLogScheme(vscp, vscpInfo);
             // Run 'prepare' step
             switch (vscpInfo.m_scheme) {
             case Scheme::Undecided:  // LCOV_EXCL_START
@@ -1331,6 +1452,7 @@ public:
 
 void V3Delayed::delayedAll(AstNetlist* nodep) {
     UINFO(2, __FUNCTION__ << ":");
+    V3SemanticTraceTag::clear();
     { DelayedVisitor{nodep}; }  // Destruct before checking
     V3Global::dumpCheckGlobalTree("delayed", 0, dumpTreeEitherLevel() >= 3);
 }
