@@ -25,6 +25,7 @@
 #include "verilatedos.h"
 
 #include "V3Ast.h"
+#include "V3File.h"
 #include "V3Graph.h"
 #include "V3OrderGraph.h"
 #include "V3Sched.h"
@@ -148,6 +149,28 @@ public:
             // AstActives in V3Order.
             return stmtsp;
         }();
+        // ---- Semantic trace: compute per-process ID/kind before the loop ----
+        std::string stKindStr;
+        std::string stProcId;
+        const bool stIsHelperProc = procp && (VN_IS(procp, AlwaysPre) || VN_IS(procp, AlwaysPost));
+        const bool stEnabled
+            = v3Global.opt.semanticTrace() && procp && !suspendable && !stIsHelperProc;
+        if (stEnabled) {
+            FileLine* const flp = procp->fileline();
+            stKindStr = "always";
+            if (const AstAlways* const alwaysp = VN_CAST(procp, Always)) {
+                switch (alwaysp->keyword().m_e) {
+                case VAlwaysKwd::ALWAYS_FF:    stKindStr = "always_ff";    break;
+                case VAlwaysKwd::ALWAYS_COMB:  stKindStr = "always_comb";  break;
+                case VAlwaysKwd::ALWAYS_LATCH: stKindStr = "always_latch"; break;
+                default:                       stKindStr = "always";       break;
+                }
+            }
+            const std::string file = V3OutFormatter::quoteNameControls(flp->filename());
+            stProcId = stKindStr + "@" + file + ":" + std::to_string(flp->lineno());
+        }
+        bool stInjectedStart = false;
+
         // Process each statement in the list starting at headp
         for (AstNode *currp = headp, *nextp; currp; currp = nextp) {
             nextp = currp->nextp();
@@ -171,10 +194,50 @@ public:
                 // Record function and sensitivity to call it with
                 m_result.emplace_back(m_funcp, domainp);
             }
+            // Inject PROCESS_START as the very first statement in the function
+            if (stEnabled && !stInjectedStart) {
+                stInjectedStart = true;
+                const std::string tp = "vlSymsp->__Vm_semanticTracep";
+                m_funcp->addStmtsp(new AstCStmt{procp->fileline(),
+                    "VL_SEMANTIC_TRACE_PROCESS_START(" + tp + ", \""
+                    + stProcId + "\", \"" + stKindStr + "\", \"clocked\");\n"});
+            }
             // Add the code to the current function
             m_funcp->addStmtsp(currp);
+            // After a top-level __Vdly__ write within a user process, record the pending
+            // NBA value.  At this point __Vdly__x holds the new tentative value and
+            // vlSelfRef.x still holds the pre-commit value — ideal for nbaPending.
+            // Note: __Vdly__ vars are localized by V3Localize (which runs after this pass),
+            // so the bare var name in the AstCStmt text is the correct local name at
+            // C++ emission time.
+            if (stEnabled) {
+                if (const AstAssign* const assp = VN_CAST(currp, Assign)) {
+                    const AstVarRef* const lhsRefp = VN_CAST(assp->lhsp(), VarRef);
+                    if (lhsRefp && lhsRefp->varp()->name().compare(0, 8, "__Vdly__") == 0) {
+                        const std::string dlyName = lhsRefp->varp()->name();
+                        // Derive display name: strip __Vdly__ prefix, then demangle __DOT__
+                        std::string displayName = lhsRefp->varp()->prettyName();
+                        if (displayName.compare(0, 8, "__Vdly__") == 0)
+                            displayName = displayName.substr(8);
+                        // Real signal access: module member via vlSelfRef
+                        const std::string realAccess = "vlSelfRef." + dlyName.substr(8);
+                        const std::string tp = "vlSymsp->__Vm_semanticTracep";
+                        m_funcp->addStmtsp(new AstCStmt{assp->fileline(),
+                            "VL_SEMANTIC_TRACE_NBA_PENDING(" + tp
+                            + ", \"" + V3OutFormatter::quoteNameControls(displayName) + "\""
+                            + ", (uint64_t)" + dlyName
+                            + ", (uint64_t)" + realAccess + ");\n"});
+                    }
+                }
+            }
             // If splitting, add in the size of the code we just added
             if (m_split) m_size += currp->nodeCount();
+        }
+        // Inject PROCESS_END after all statements in the last function
+        if (stInjectedStart) {
+            const std::string tp = "vlSymsp->__Vm_semanticTracep";
+            m_funcp->addStmtsp(new AstCStmt{procp->fileline(),
+                "VL_SEMANTIC_TRACE_PROCESS_END(" + tp + ");\n"});
         }
         // Put suspendable processes into individual functions on their own
         if (suspendable) forceNewFunction();

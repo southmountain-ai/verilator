@@ -23,6 +23,7 @@
 #include "V3EmitCConstInit.h"
 #include "V3Global.h"
 #include "V3MemberMap.h"
+#include "V3SemanticTraceTag.h"
 
 #include <algorithm>
 #include <map>
@@ -120,6 +121,7 @@ class EmitCFunc VL_NOT_FINAL : public EmitCConstInit {
     AstVarRef* m_wideTempRefp = nullptr;  // Variable that _WW macros should be setting
     std::unordered_map<AstJumpBlock*, size_t> m_labelNumbers;  // Label numbers for AstJumpBlocks
     bool m_createdScopeHash = false;  // Already created a scope hash
+    bool m_stInProcess = false;  // Inside a VL_SEMANTIC_TRACE_PROCESS_START/END block
 
     // State associated with processing $display style string formatting
     struct EmitDispState final {
@@ -642,6 +644,25 @@ public:
         if (paren) puts(")");
         if (decind) ofp()->blockDec();
         puts(";\n");
+        // Emit NBA_PENDING immediately after a __Vdly__ write inside a traced process.
+        // At this point __Vdly__x holds the new tentative value and vlSelfRef.x holds
+        // the pre-commit value.  Both are in scope because V3Localize has already run.
+        if (v3Global.opt.semanticTrace() && m_stInProcess) {
+            if (const AstVarRef* const lhsRefp = VN_CAST(nodep->lhsp(), VarRef)) {
+                const std::string& dlyName = lhsRefp->varp()->name();
+                if (dlyName.compare(0, 8, "__Vdly__") == 0) {
+                    std::string displayName = lhsRefp->varp()->prettyName();
+                    if (displayName.compare(0, 8, "__Vdly__") == 0)
+                        displayName = displayName.substr(8);
+                    const std::string currentExpr = "vlSelfRef." + dlyName.substr(8);
+                    putnbs(nodep,
+                           "VL_SEMANTIC_TRACE_NBA_PENDING(vlSymsp->__Vm_semanticTracep"
+                           ", \"" + V3OutFormatter::quoteNameControls(displayName) + "\""
+                           ", (uint64_t)" + dlyName
+                           + ", (uint64_t)" + currentExpr + ");\n");
+                }
+            }
+        }
     }
     void visit(AstAssocSel* nodep) override {
         iterateAndNextConstNull(nodep->fromp());
@@ -1401,6 +1422,16 @@ public:
         puts(nodep->suffix());
     }
     void visit(AstCStmt* nodep) override {
+        // Detect semantic trace process boundaries to track when we're inside a user process
+        if (v3Global.opt.semanticTrace()) {
+            if (const AstText* const textp = VN_CAST(nodep->nodesp(), Text)) {
+                const std::string& t = textp->text();
+                if (t.compare(0, 31, "VL_SEMANTIC_TRACE_PROCESS_START") == 0)
+                    m_stInProcess = true;
+                else if (t.compare(0, 29, "VL_SEMANTIC_TRACE_PROCESS_END") == 0)
+                    m_stInProcess = false;
+            }
+        }
         putnbs(nodep, "");
         emitNodesWithText(nodep->nodesp(), false, true, "");
         ensureNewLine();

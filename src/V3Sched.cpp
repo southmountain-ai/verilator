@@ -53,6 +53,101 @@ namespace V3Sched {
 namespace {
 
 //============================================================================
+// SemanticSnapshotEmitter
+//
+// Walks the netlist and, for each user-visible AstVarScope, appends a
+// VL_SEMANTIC_TRACE_SNAPSHOT_PUT call to `funcp`.
+//
+// "User-visible" means: not a Verilator-internal temporary (isTemp()),
+// not a function-local or class member, and has a plain scalar or
+// unpacked-array-of-scalar dtype that fits in 64 bits per element.
+// This exactly mirrors the VCD trace signal filter in V3TraceDecl.cpp.
+//
+// The generated snippet (inserted at the end of _eval, after all
+// active/NBA regions have settled) captures:
+//   * Input port values that drove clocked processes this time step.
+//   * Combinational output values after NBA commits re-evaluated them.
+// Together these address gap #1 and gap #5 from the trace quality analysis.
+
+class SemanticSnapshotEmitter final : public VNVisitor {
+    AstCFunc* const m_funcp;  // Function to append AstCStmt nodes to
+    FileLine* const m_flp;    // FileLine for synthetic nodes
+
+    // Return the C++ member-access expression for a VarScope in the root struct.
+    // After V3Scope, flattened vars have names like "top__DOT__dut__DOT__count";
+    // the root-struct member is accessed as "vlSelfRef.<that_name>".
+    static std::string memberAccess(const AstVarScope* vscp) {
+        return std::string{"vlSelfRef."} + vscp->varp()->nameProtect();
+    }
+
+    // Human-readable dot-separated hierarchical name, e.g. "top.dut.count".
+    static std::string displayName(const AstVarScope* vscp) {
+        return vscp->varp()->prettyName();
+    }
+
+    // Emit a SNAPSHOT_PUT call for one scalar (or one array element).
+    //   accessExpr   — C++ rvalue, e.g. "vlSelfRef.foo" or "vlSelfRef.mem[2]"
+    //   sigName      — display name, e.g. "top.mem[2]"
+    //   width        — bit width (must be 1–64)
+    void emitPut(const std::string& accessExpr, const std::string& sigName, int width) {
+        const std::string tp = "vlSymsp->__Vm_semanticTracep";
+        m_funcp->addStmtsp(new AstCStmt{
+            m_flp, "VL_SEMANTIC_TRACE_SNAPSHOT_PUT(" + tp + ", \""
+                       + V3OutFormatter::quoteNameControls(sigName) + "\", (uint64_t)("
+                       + accessExpr + "), " + std::to_string(width) + ");\n"});
+    }
+
+    void visit(AstVarScope* vscp) override {
+        const AstVar* const varp = vscp->varp();
+
+        // --- Exclusion filters (same as V3TraceDecl) ---
+        if (varp->isTemp()) return;
+        if (varp->isClassMember()) return;
+        if (varp->isFuncLocal()) return;
+        if (varp->isParam()) return;
+
+        const AstNodeDType* const dtypep = varp->dtypep()->skipRefp();
+
+        if (const AstUnpackArrayDType* const adtp = VN_CAST(dtypep, UnpackArrayDType)) {
+            // Unpacked array: emit one entry per element if elements are scalar ≤ 64b.
+            const AstNodeDType* const subp = adtp->subDTypep()->skipRefp();
+            if (!subp->basicp()) return;  // nested arrays / complex types: skip
+            const int elemWidth = subp->basicp()->widthMin();
+            if (elemWidth < 1 || elemWidth > 64) return;
+
+            const std::string base = memberAccess(vscp);
+            const std::string name = displayName(vscp);
+            const int lo = adtp->lo();
+            const int hi = adtp->hi();
+            // Always iterate lo → hi (ascending) for deterministic output.
+            const int step = (lo <= hi) ? 1 : -1;
+            for (int i = lo; i != hi + step; i += step) {
+                const int arrayIdx = i - adtp->lo();
+                emitPut(base + "[" + std::to_string(arrayIdx) + "]",
+                        name + "[" + std::to_string(i) + "]", elemWidth);
+            }
+        } else if (const AstBasicDType* const basicp = dtypep->basicp()) {
+            // Scalar signal — must fit in 64 bits.
+            if (basicp->isOpaque()) return;  // string, event, etc.
+            const int width = varp->widthMin();
+            if (width < 1 || width > 64) return;
+            emitPut(memberAccess(vscp), displayName(vscp), width);
+        }
+        // Other dtype categories (interfaces, structs, etc.) — skip for now.
+    }
+
+    void visit(AstNode* nodep) override { iterateChildren(nodep); }
+
+public:
+    SemanticSnapshotEmitter(AstNetlist* netlistp, AstCFunc* funcp, FileLine* flp)
+        : m_funcp{funcp}, m_flp{flp} {
+        iterate(netlistp);
+    }
+};
+
+
+
+//============================================================================
 // Utility functions
 
 std::vector<const AstSenTree*> getSenTreesUsedBy(const std::vector<const LogicByScope*>& lbsps) {
@@ -350,7 +445,36 @@ void orderSequentially(AstCFunc* funcp, const LogicByScope& lbs) {
                             bodyp = loopp;
                         }
                     }
+                    const bool stTrackProcess
+                        = !VN_IS(procp, AlwaysPre) && !VN_IS(procp, AlwaysPost);
+                    if (v3Global.opt.semanticTrace() && stTrackProcess) {
+                        FileLine* const pflp = procp->fileline();
+                        // Determine process kind string from AST node type and keyword.
+                        std::string kindStr = "procedure";
+                        if (const AstAlways* const alwaysp = VN_CAST(procp, Always)) {
+                            switch (alwaysp->keyword().m_e) {
+                            case VAlwaysKwd::ALWAYS_FF:    kindStr = "always_ff";   break;
+                            case VAlwaysKwd::ALWAYS_COMB:  kindStr = "always_comb"; break;
+                            case VAlwaysKwd::ALWAYS_LATCH: kindStr = "always_latch"; break;
+                            default:                       kindStr = "always";      break;
+                            }
+                        }
+                        const std::string file
+                            = V3OutFormatter::quoteNameControls(pflp->filename());
+                        const std::string procId
+                            = kindStr + "@" + file + ":" + std::to_string(pflp->lineno());
+                        const std::string tp = "vlSymsp->__Vm_semanticTracep";
+                        subFuncp->addStmtsp(new AstCStmt{
+                            pflp, "VL_SEMANTIC_TRACE_PROCESS_START(" + tp + ", \""
+                                      + procId + "\", \"" + kindStr
+                                      + "\", \"clocked\");\n"});
+                    }
                     subFuncp->addStmtsp(bodyp);
+                    if (v3Global.opt.semanticTrace() && stTrackProcess) {
+                        subFuncp->addStmtsp(new AstCStmt{
+                            procp->fileline(),
+                            "VL_SEMANTIC_TRACE_PROCESS_END(vlSymsp->__Vm_semanticTracep);\n"});
+                    }
                     if (procp->needProcess()) subFuncp->setNeedProcess();
                     util::splitCheck(subFuncp);
                 }
@@ -648,8 +772,41 @@ void createEval(AstNetlist* netlistp,  //
             }
             // Resume triggered timing schedulers
             if (timingResumep) workp = AstNode::addNext(workp, timingResumep->makeStmt());
+            // Semantic trace: active region start (pass current sim time)
+            if (v3Global.opt.semanticTrace()) {
+                // Only word 0 of the trigger vector is captured. Designs with >64 unique
+                // sensitivities produce multiple words and the extra bits are silently dropped.
+                // To support multiple words: change VL_SEMANTIC_TRACE_ACTIVE_START to accept
+                //   (tracep, time, const uint64_t* trigWords, uint32_t nWords)
+                // and emit trigger_vec as a JSON array ["0x...", "0x..."].
+                // The trigger_map bit indices already use absolute positions so no schema change
+                // is needed there; only activeRegionStart/nbaRegionStart need updating.
+                if (trigKit.nVecWords() > 1) {
+                    netlistp->v3warn(E_UNSUPPORTED,
+                                     "--semantic-trace: this design has "
+                                         << (trigKit.nVecWords() * TriggerKit::WORD_SIZE)
+                                         << " trigger bits (" << trigKit.nVecWords()
+                                         << " words); only the first 64 bits (word 0) will be "
+                                            "captured in trigger_vec. See V3Sched.cpp for how to "
+                                            "extend to multi-word support.");
+                }
+                workp = AstNode::addNext(
+                    workp,
+                    new AstCStmt{flp,
+                                 "VL_SEMANTIC_TRACE_ACTIVE_START(vlSymsp->__Vm_semanticTracep,"
+                                 " (uint64_t)vlSymsp->_vm_contextp__->time(),"
+                                 " (uint64_t)vlSelfRef."
+                                     + actKit.m_vscp->varp()->name() + "[0U]);\n"});
+            }
             // Invoke the 'act' function
             workp = AstNode::addNext(workp, util::callVoidFunc(actKit.m_funcp));
+            // Semantic trace: active region end
+            if (v3Global.opt.semanticTrace()) {
+                workp = AstNode::addNext(
+                    workp,
+                    new AstCStmt{flp,
+                                 "VL_SEMANTIC_TRACE_ACTIVE_END(vlSymsp->__Vm_semanticTracep);\n"});
+            }
             //
             return workp;
         }());
@@ -715,8 +872,24 @@ void createEval(AstNetlist* netlistp,  //
             } else if (!reactKit.empty()) {
                 workp = trigKit.newOrIntoCall(reactKit.m_vscp, nbaKit.m_vscp);
             }
+            // Semantic trace: NBA region start
+            if (v3Global.opt.semanticTrace()) {
+                workp = AstNode::addNext(
+                    workp,
+                    new AstCStmt{flp,
+                                 "VL_SEMANTIC_TRACE_NBA_START(vlSymsp->__Vm_semanticTracep,"
+                                 " (uint64_t)vlSelfRef."
+                                     + nbaKit.m_vscp->varp()->name() + "[0U]);\n"});
+            }
             // Invoke the 'nba' function
             workp = AstNode::addNext(workp, util::callVoidFunc(nbaKit.m_funcp));
+            // Semantic trace: NBA region end
+            if (v3Global.opt.semanticTrace()) {
+                workp = AstNode::addNext(
+                    workp,
+                    new AstCStmt{flp,
+                                 "VL_SEMANTIC_TRACE_NBA_END(vlSymsp->__Vm_semanticTracep);\n"});
+            }
             // Clear the 'nba' triggers
             workp = AstNode::addNext(workp, trigKit.newClearCall(nbaKit.m_vscp));
             //
@@ -803,6 +976,20 @@ void createEval(AstNetlist* netlistp,  //
 
     // Add the Postponed eval call
     if (postponedFuncp) funcp->addStmtsp(util::callVoidFunc(postponedFuncp));
+
+    // Semantic trace: signal snapshot after all active/NBA regions have settled.
+    // This is the fully-quiesced state: state registers hold post-NBA values and
+    // combinational outputs (full, empty, rd_data, …) have been re-evaluated.
+    // Captures input port values (#1) and combinational outputs (#5).
+    if (v3Global.opt.semanticTrace()) {
+        const std::string tp = "vlSymsp->__Vm_semanticTracep";
+        funcp->addStmtsp(new AstCStmt{
+            flp, "VL_SEMANTIC_TRACE_SNAPSHOT_BEGIN(" + tp
+                     + ", (uint64_t)vlSymsp->_vm_contextp__->time());\n"});
+        SemanticSnapshotEmitter{netlistp, funcp, flp};
+        funcp->addStmtsp(
+            new AstCStmt{flp, "VL_SEMANTIC_TRACE_SNAPSHOT_END(" + tp + ");\n"});
+    }
 
     if (v3Global.opt.profExec()) funcp->addStmtsp(AstCStmt::profExecSectionPop(flp, "eval"));
 }

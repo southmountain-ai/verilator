@@ -676,6 +676,7 @@ void EmitCSyms::emitSymHdr() {
             puts("#include \"" + base + ".h\"\n");
     }
     if (v3Global.opt.usesProfiler()) puts("#include \"verilated_profiler.h\"\n");
+    if (v3Global.opt.semanticTrace()) puts("#include \"verilated_semantic_trace.h\"\n");
 
     puts("\n// INCLUDE MODEL CLASS\n");
     puts("\n#include \"" + topClassName() + ".h\"\n");
@@ -723,6 +724,10 @@ void EmitCSyms::emitSymHdr() {
              "  ///< Used by trace routines to determine change occurred\n");
         puts("uint32_t __Vm_baseCode = 0;"
              "  ///< Used by trace routines when tracing multiple models\n");
+    }
+    if (v3Global.opt.semanticTrace()) {
+        puts("VerilatedSemanticTrace* __Vm_semanticTracep = nullptr;"
+             "  ///< Semantic execution trace (--semantic-trace)\n");
     }
     if (v3Global.hasEvents()) {
         if (v3Global.assignsEvents()) {
@@ -1049,6 +1054,21 @@ std::vector<std::string> EmitCSyms::getSymCtorStmts() {
         }
     }
 
+    if (v3Global.opt.semanticTrace()) {
+        const std::string escapedFile
+            = V3OutFormatter::quoteNameControls(v3Global.opt.semanticTraceFile());
+        add("// Initialize semantic execution trace");
+        add("__Vm_semanticTracep = new VerilatedSemanticTrace(\"" + escapedFile + "\");");
+        // Register trigger descriptions before simStart() so they appear in sim_start record
+        const std::vector<std::string>& trigDescs = v3Global.rootp()->semanticActTrigDescs();
+        for (uint32_t i = 0; i < static_cast<uint32_t>(trigDescs.size()); ++i) {
+            if (trigDescs[i].empty()) continue;
+            add("__Vm_semanticTracep->registerTrigger(" + std::to_string(i) + ", \""
+                + V3OutFormatter::quoteNameControls(trigDescs[i]) + "\");");
+        }
+        add("__Vm_semanticTracep->simStart(\"" + topClassName() + "\");");
+    }
+
     return stmts;
 }
 
@@ -1076,6 +1096,13 @@ std::vector<std::string> EmitCSyms::getSymDtorStmts() {
         const AstNodeModule* const modp = itpair.second;
         if (modp->isTop()) continue;
         add(protect(scopep->nameDotless()) + ".dtor();");
+    }
+    if (v3Global.opt.semanticTrace()) {
+        add("// Teardown semantic execution trace");
+        add("if (__Vm_semanticTracep) {");
+        add("    __Vm_semanticTracep->simEnd();");
+        add("    VL_DO_CLEAR(delete __Vm_semanticTracep, __Vm_semanticTracep = nullptr);");
+        add("}");
     }
     return stmts;
 }
