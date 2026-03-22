@@ -46,6 +46,7 @@
 #include <cassert>
 #include <cstdint>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <string>
 
@@ -77,6 +78,9 @@ class VerilatedSemanticTrace final {
     uint64_t m_actIteration = 0;  // Active region iterations at current time step
     uint64_t m_nbaIteration = 0;  // NBA region iterations at current time step
     uint32_t m_processIndex = 0;  // Execution order of processes within current region
+
+    // Signal snapshot state
+    bool m_snapshotFirst = true;  // JSON comma guard inside signal_snapshot record
 
     // =========================================================================
     // JSON helpers (no external dependency)
@@ -306,6 +310,48 @@ public:
         m_out << "]}\n";
         ++m_delta;
     }
+
+    // =========================================================================
+    // Signal snapshot  (emitted once per eval() call, after all regions settle)
+    //
+    // Records the fully-settled values of all user-visible signals.  Together
+    // with the active/nba region records this answers:
+    //   - What input values were present when the clocked processes ran? (#1)
+    //   - What are the combinational outputs after NBA commits? (#5)
+    //
+    // Usage (generated code pattern):
+    //   tracep->signalSnapshotBegin(time);
+    //   tracep->signalSnapshotPut("mod.sig", (uint64_t)val, width);   // scalar
+    //   tracep->signalSnapshotPut("mod.arr[0]", (uint64_t)val, width); // array elem
+    //   tracep->signalSnapshotEnd();
+    // =========================================================================
+
+    // Open the signal_snapshot record for the given simulation time.
+    void signalSnapshotBegin(uint64_t time) {
+        m_out << "{\"type\":\"signal_snapshot\","
+              << "\"time\":" << time << ","
+              << "\"signals\":{";
+        m_snapshotFirst = true;
+    }
+
+    // Emit one scalar (or array-element) signal value.
+    //   name  — hierarchical RTL name, e.g. "top.dut.count" or "top.dut.mem[2]"
+    //   val   — current value (cast to uint64_t by caller)
+    //   width — bit width (1–64); values wider than 64 bits are not supported here
+    void signalSnapshotPut(const char* name, uint64_t val, uint32_t width) {
+        if (!m_snapshotFirst) m_out << ',';
+        m_snapshotFirst = false;
+        // Mask to declared width to suppress upper garbage bits.
+        if (width < 64) val &= (1ULL << width) - 1ULL;
+        // Emit with enough hex digits to represent the full width.
+        const uint32_t nibbles = (width + 3) / 4;
+        std::ostringstream oss;
+        oss << std::hex << std::setw(nibbles) << std::setfill('0') << val;
+        m_out << '"' << name << "\":\"0x" << oss.str() << '"';
+    }
+
+    // Close the signal_snapshot record.
+    void signalSnapshotEnd() { m_out << "}}\n"; }
 };
 
 //=============================================================================
@@ -338,5 +384,14 @@ public:
 
 #define VL_SEMANTIC_TRACE_REGISTER_TRIGGER(tracep, bit, desc) \
     do { if (tracep) (tracep)->registerTrigger(bit, desc); } while (false)
+
+#define VL_SEMANTIC_TRACE_SNAPSHOT_BEGIN(tracep, time) \
+    do { if (tracep) (tracep)->signalSnapshotBegin(time); } while (false)
+
+#define VL_SEMANTIC_TRACE_SNAPSHOT_PUT(tracep, name, val, width) \
+    do { if (tracep) (tracep)->signalSnapshotPut(name, (uint64_t)(val), width); } while (false)
+
+#define VL_SEMANTIC_TRACE_SNAPSHOT_END(tracep) \
+    do { if (tracep) (tracep)->signalSnapshotEnd(); } while (false)
 
 #endif  // VERILATOR_VERILATED_SEMANTIC_TRACE_H_
